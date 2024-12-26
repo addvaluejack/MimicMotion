@@ -8,5 +8,14 @@ logger = logging.getLogger(__name__)
 def save_to_mp4(frames, save_path, fps=7):
     frames = frames.permute((0, 2, 3, 1))  # (f, c, h, w) to (f, h, w, c)
     Path(save_path).parent.mkdir(parents=True, exist_ok=True)
-    write_video(save_path, frames, fps=fps)
+    try:
+        write_video(save_path, frames, fps=fps)
+    except Exception as e:
+        import torch
+        import cv2
+        video_array = torch.as_tensor(video_array, dtype=torch.uint8).numpy()
+        i = 0
+        for img in video_array:
+            cv2.imwrite(f'{save_path}/{i:06d}.jpg', img)
+            i += 1
 

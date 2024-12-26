@@ -54,6 +54,8 @@ from diffusers.utils import check_min_version, deprecate, is_wandb_available, lo
 from diffusers.utils.import_utils import is_xformers_available
 
 from torch.utils.data import Dataset
+from mimicmotion.pipelines.pipeline_mimicmotion import MimicMotionPipeline
+from mimicmotion.utils.loader import MimicMotionModel
 
 # Will error if the minimal version of diffusers is not installed. Remove at your own risks.
 check_min_version("0.24.0.dev0")
@@ -96,7 +98,7 @@ class DummyDataset(Dataset):
         """
         # Randomly select a folder (representing a video) from the base folder
         chosen_folder = random.choice(self.folders)
-        folder_path = os.path.join(self.base_folder, chosen_folder)
+        folder_path = os.path.join(self.base_folder, chosen_folder, "images")
         frames = os.listdir(folder_path)
         # Sort the frames by name
         frames.sort()
@@ -112,6 +114,7 @@ class DummyDataset(Dataset):
 
         # Initialize a tensor to store the pixel values
         pixel_values = torch.empty((self.sample_frames, self.channels, self.height, self.width))
+        pose_values = torch.empty((self.sample_frames, self.channels, self.height, self.width))
 
         # Load and process each frame
         for i, frame_name in enumerate(selected_frames):
@@ -133,7 +136,26 @@ class DummyDataset(Dataset):
                         dim=2, keepdim=True)  # For grayscale images
 
                 pixel_values[i] = img_normalized
-        return {'pixel_values': pixel_values}
+            
+            with Image.open(frame_path.replace("images", "poses")) as img:
+                # Resize the image and convert it to a tensor
+                img_resized = img.resize((self.width, self.height))
+                img_tensor = torch.from_numpy(np.array(img_resized)).float()
+
+                # Normalize the image by scaling pixel values to [-1, 1]
+                img_normalized = img_tensor / 127.5 - 1
+
+                # Rearrange channels if necessary
+                if self.channels == 3:
+                    img_normalized = img_normalized.permute(
+                        2, 0, 1)
+                elif self.channels == 1:
+                    img_normalized = img_normalized.mean(
+                        dim=2, keepdim=True)
+                
+                pose_values[i] = img_normalized
+
+        return {'pixel_values': pixel_values, 'pose_values': pose_values}
 
 # resizing utils
 # TODO: clean up later
@@ -640,20 +662,14 @@ def main():
             ).repo_id
 
     # Load img encoder, tokenizer and models.
-    feature_extractor = CLIPImageProcessor.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder="feature_extractor", revision=args.revision
-    )
-    image_encoder = CLIPVisionModelWithProjection.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder="image_encoder", revision=args.revision
-    )
-    vae = AutoencoderKLTemporalDecoder.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder="vae", revision=args.revision, variant="fp16")
-    unet = UNetSpatioTemporalConditionModel.from_pretrained(
-        args.pretrained_model_name_or_path if args.pretrain_unet is None else args.pretrain_unet,
-        subfolder="unet",
-        low_cpu_mem_usage=True,
-        variant="fp16"
-    )
+    mimicmotion_models = MimicMotionModel(args.pretrained_model_name_or_path)
+    mimicmotion_models.load_state_dict(torch.load("models/MimicMotion_1-1.pth", map_location="cpu"), strict=False)
+    feature_extractor = mimicmotion_models.feature_extractor
+    image_encoder = mimicmotion_models.image_encoder
+    vae = mimicmotion_models.vae
+    unet = mimicmotion_models.unet
+    scheduler=mimicmotion_models.noise_scheduler
+    pose_net=mimicmotion_models.pose_net
 
     # Freeze vae and image_encoder
     vae.requires_grad_(False)
@@ -1018,8 +1034,13 @@ def main():
 
                 # check https://arxiv.org/abs/2206.00364(the EDM-framework) for more details.
                 target = latents
+                print(f"Latents shape: {inp_noisy_latents.shape}")
+                pose_values = batch["pose_values"].to(weight_dtype).to(
+                    accelerator.device, non_blocking=True
+                )
+                pose_latents = pose_net(pose_values)
                 model_pred = unet(
-                    inp_noisy_latents, timesteps, encoder_hidden_states, added_time_ids=added_time_ids).sample
+                    inp_noisy_latents, timesteps, encoder_hidden_states, added_time_ids=added_time_ids, pose_latents=pose_latents).sample
 
                 # Denoise the latents
                 c_out = -sigmas / ((sigmas**2 + 1)**0.5)
@@ -1103,14 +1124,13 @@ def main():
                             ema_unet.store(unet.parameters())
                             ema_unet.copy_to(unet.parameters())
                         # The models need unwrapping because for compatibility in distributed training mode.
-                        pipeline = StableVideoDiffusionPipeline.from_pretrained(
-                            args.pretrained_model_name_or_path,
-                            unet=accelerator.unwrap_model(unet),
-                            image_encoder=accelerator.unwrap_model(
-                                image_encoder),
-                            vae=accelerator.unwrap_model(vae),
-                            revision=args.revision,
-                            torch_dtype=weight_dtype,
+                        pipeline = MimicMotionPipeline(
+                            vae=vae, 
+                            image_encoder=image_encoder, 
+                            unet=unet, 
+                            scheduler=scheduler,
+                            feature_extractor=feature_extractor, 
+                            pose_net=pose_net
                         )
                         pipeline = pipeline.to(accelerator.device)
                         pipeline.set_progress_bar_config(disable=True)
@@ -1170,12 +1190,13 @@ def main():
         if args.use_ema:
             ema_unet.copy_to(unet.parameters())
 
-        pipeline = StableVideoDiffusionPipeline.from_pretrained(
-            args.pretrained_model_name_or_path,
-            image_encoder=accelerator.unwrap_model(image_encoder),
-            vae=accelerator.unwrap_model(vae),
-            unet=unet,
-            revision=args.revision,
+        pipeline = MimicMotionPipeline(
+            vae=vae, 
+            image_encoder=image_encoder, 
+            unet=unet, 
+            scheduler=scheduler,
+            feature_extractor=feature_extractor, 
+            pose_net=pose_net
         )
         pipeline.save_pretrained(args.output_dir)
 

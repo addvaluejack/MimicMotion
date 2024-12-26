@@ -161,3 +161,10 @@ outputs/
 
 # Replicate
 .cog
+
+# Custom
+cut_results/
+*.jpg
+*.mp4
+*.yaml
+base_folder/

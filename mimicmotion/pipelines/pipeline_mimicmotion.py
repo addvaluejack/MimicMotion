@@ -567,6 +567,7 @@ class MimicMotionPipeline(DiffusionPipeline):
 
                     # classification-free inference
                     pose_latents = self.pose_net(image_pose[idx].to(device))
+                    print(f"Latents shape: {latent_model_input.shape}")
                     _noise_pred = self.unet(
                         latent_model_input[:1, idx],
                         t,
